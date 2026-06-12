@@ -53,3 +53,11 @@ jobs:
           labels: |
             org.opencontainers.image.description=TGND Flux Kontext Dev image editing on RunPod
           provenance: false
+
+      - name: Make package public
+        run: |
+          curl -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/orgs/tgnd-theme/packages/container/tgnd-flux-kontext" \
+            -d '{"visibility":"public"}' || true
