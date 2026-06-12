@@ -62,14 +62,31 @@ def load_model():
     from diffusers import FluxKontextPipeline
 
     hf_token = os.environ.get("HF_TOKEN", "")
-    print(f"[KONTEXT] Loading FluxKontextPipeline...", flush=True)
+    model_id = "black-forest-labs/FLUX.1-Kontext-dev"
+
+    # Use network volume cache if available
+    volume_cache = "/runpod-volume/models/kontext-dev"
+    local_cache = None
+    if os.path.exists("/runpod-volume"):
+        if os.path.exists(os.path.join(volume_cache, "model_index.json")):
+            local_cache = volume_cache
+            print(f"[KONTEXT] Loading from volume cache: {volume_cache}", flush=True)
+        else:
+            print(f"[KONTEXT] Volume cache miss, downloading + caching...", flush=True)
 
     t0 = time.time()
     pipe = FluxKontextPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-Kontext-dev",
+        local_cache or model_id,
         torch_dtype=torch.bfloat16,
         token=hf_token if hf_token else None,
     )
+
+    # Cache to volume for next cold start
+    if not local_cache and os.path.exists("/runpod-volume"):
+        os.makedirs(volume_cache, exist_ok=True)
+        pipe.save_pretrained(volume_cache)
+        print(f"[KONTEXT] Cached model to {volume_cache}", flush=True)
+
     pipe.to("cuda")
 
     # Disable safety checker if it exists
