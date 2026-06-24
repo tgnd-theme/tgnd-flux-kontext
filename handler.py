@@ -118,6 +118,12 @@ def handler(job):
         load_model()
 
         inp = job.get("input", {})
+
+        # Health check for warmup pings
+        if inp.get("health_check"):
+            load_model()
+            return {"status": "ok", "mode": "kontext", "message": "Model loaded and ready"}
+
         image_src = inp.get("image", "")
         prompt = inp.get("prompt", "")
         guidance_scale = float(inp.get("guidance_scale", 2.5))
