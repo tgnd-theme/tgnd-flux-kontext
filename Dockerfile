@@ -2,17 +2,17 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Upgrade torch for CUDA 12.4
+# Torch voor CUDA 12.4
 RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Install dependencies
-# diffusers from git main for FluxKontextPipeline support
+# diffusers van git main: QwenImageEditPlusPipeline en Flux2KleinPipeline; transformers nieuw genoeg voor Qwen2.5-VL en Qwen3.
 RUN pip install --no-cache-dir \
     runpod \
     git+https://github.com/huggingface/diffusers.git \
-    'transformers>=4.50.0,<4.52.0' \
+    'transformers>=4.56.0' \
     accelerate \
+    peft \
     safetensors \
     sentencepiece \
     protobuf \
@@ -20,11 +20,8 @@ RUN pip install --no-cache-dir \
     requests \
     Pillow
 
-# Verify FluxKontextPipeline is available
-RUN python3 -c "from diffusers import FluxKontextPipeline; print('FluxKontextPipeline OK')"
+RUN python3 -c "from diffusers import QwenImageEditPlusPipeline, Flux2KleinPipeline; print('pipelines OK')"
 
-# Copy handler
 COPY handler.py /app/handler.py
 
-# RunPod serverless entry
 CMD ["python3", "-u", "/app/handler.py"]

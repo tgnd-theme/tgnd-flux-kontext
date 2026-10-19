@@ -1,23 +1,18 @@
 """
-RunPod Serverless Handler — Flux Kontext Dev image editing.
+RunPod Serverless Handler — TGND foto-bewerking (19 okt 2026).
 
-Takes a real photo + text instruction, outputs edited photo.
-No safety checker. No NSFW filter. Full control.
+Vervangt Flux Kontext dev (gated op de Hub, "cannot find the requested files") door open modellen zonder
+contentfilter en met een commerciële licentie (Apache 2.0):
+  - qwen  (standaard): Qwen/Qwen-Image-Edit-2509 + Lightning-LoRA (8 stappen, true_cfg 1.0). Beste gezichts- en
+          lichaamsbehoud; ~57 GB gewichten, dus 80 GB-GPU en een network volume als cache.
+  - klein: black-forest-labs/FLUX.2-klein-4B (4 stappen, guidance 1.0). Snel en klein; B-test naast Qwen.
 
-Input:
-  - image: URL or base64 of input image
-  - prompt: edit instruction (e.g. "Change setting to bedroom, she is wearing only a black thong")
-  - guidance_scale: float (default 2.5)
-  - num_inference_steps: int (default 28)
-  - seed: int (optional, random if not set)
-  - width: int (optional, auto from input)
-  - height: int (optional, auto from input)
-
-Output:
-  - image: base64 PNG
-  - mode: "kontext"
-  - seed: int
-  - inference_time: float
+Zelfde contract als de oude Kontext-worker, zodat WordPress (TGND_Studio_RunPod_Client::create_kontext_prediction)
+niets hoeft te veranderen:
+  input:  image (url of base64), prompt, seed (optioneel), model ("qwen" | "klein", optioneel),
+          num_inference_steps / guidance_scale (optioneel; standaard per model)
+  output: image (base64 PNG), mode, seed, inference_time, resolution
+Health check: {"health_check": true}.
 """
 
 import os
@@ -29,178 +24,130 @@ import traceback
 
 try:
     import runpod
-    print(f"[KONTEXT] runpod {runpod.__version__}", flush=True)
+    print(f"[EDIT] runpod {runpod.__version__}", flush=True)
 except Exception as e:
-    print(f"[KONTEXT] FATAL: cannot import runpod: {e}", flush=True)
+    print(f"[EDIT] FATAL: cannot import runpod: {e}", flush=True)
     sys.exit(1)
 
-try:
-    import torch
-    print(f"[KONTEXT] torch {torch.__version__}, CUDA: {torch.cuda.is_available()}", flush=True)
-except Exception as e:
-    print(f"[KONTEXT] FATAL: cannot import torch: {e}", flush=True)
-    sys.exit(1)
+import torch
+from PIL import Image
 
-try:
-    import numpy as np
-    from PIL import Image
-    print(f"[KONTEXT] numpy {np.__version__}, PIL OK", flush=True)
-except Exception as e:
-    print(f"[KONTEXT] FATAL: cannot import numpy/PIL: {e}", flush=True)
-    sys.exit(1)
+print(f"[EDIT] torch {torch.__version__}, CUDA: {torch.cuda.is_available()}", flush=True)
 
-pipe = None
+VOLUME = "/runpod-volume"
+if os.path.isdir(VOLUME):
+    # Gewichten één keer downloaden, daarna uit het volume (koude start in seconden in plaats van minuten).
+    os.environ.setdefault("HF_HOME", os.path.join(VOLUME, "hf"))
+    os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+    print(f"[EDIT] HF cache on volume: {os.environ['HF_HOME']}", flush=True)
+
+QWEN_ID = "Qwen/Qwen-Image-Edit-2509"
+QWEN_LORA_REPO = "lightx2v/Qwen-Image-Lightning"
+QWEN_LORA_FILE = "Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors"
+KLEIN_ID = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_MODEL = os.environ.get("TGND_EDIT_MODEL", "qwen")
+MAX_SIDE = 1536
+
+_pipes = {}
 
 
-def load_model():
-    """Load Flux Kontext Dev pipeline once on cold start."""
-    global pipe
-
-    if pipe is not None:
-        return
-
-    from diffusers import FluxKontextPipeline
-
-    hf_token = os.environ.get("HF_TOKEN", "")
-    model_id = "black-forest-labs/FLUX.1-Kontext-dev"
-
-    # Use network volume cache if available
-    volume_cache = "/runpod-volume/models/kontext-dev"
-    local_cache = None
-    if os.path.exists("/runpod-volume"):
-        if os.path.exists(os.path.join(volume_cache, "model_index.json")):
-            local_cache = volume_cache
-            print(f"[KONTEXT] Loading from volume cache: {volume_cache}", flush=True)
-        else:
-            print(f"[KONTEXT] Volume cache miss, downloading + caching...", flush=True)
-
+def load_model(name):
+    """Pipeline per model, één keer per worker."""
+    if name in _pipes:
+        return _pipes[name]
     t0 = time.time()
-    pipe = FluxKontextPipeline.from_pretrained(
-        local_cache or model_id,
-        torch_dtype=torch.bfloat16,
-        token=hf_token if hf_token else None,
-    )
-
-    # Cache to volume for next cold start
-    if not local_cache and os.path.exists("/runpod-volume"):
-        os.makedirs(volume_cache, exist_ok=True)
-        pipe.save_pretrained(volume_cache)
-        print(f"[KONTEXT] Cached model to {volume_cache}", flush=True)
-
-    pipe.to("cuda")
-
-    # Disable safety checker if it exists
-    if hasattr(pipe, "safety_checker"):
-        pipe.safety_checker = None
-    if hasattr(pipe, "feature_extractor"):
-        pipe.feature_extractor = None
-
-    dt = time.time() - t0
-    print(f"[KONTEXT] Model loaded in {dt:.1f}s", flush=True)
-    print(f"[KONTEXT] VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB allocated", flush=True)
+    token = os.environ.get("HF_TOKEN") or None
+    if name == "klein":
+        from diffusers import Flux2KleinPipeline
+        pipe = Flux2KleinPipeline.from_pretrained(KLEIN_ID, torch_dtype=torch.bfloat16, token=token)
+        pipe.to("cuda")
+    else:
+        from diffusers import QwenImageEditPlusPipeline
+        pipe = QwenImageEditPlusPipeline.from_pretrained(QWEN_ID, torch_dtype=torch.bfloat16, token=token)
+        pipe.load_lora_weights(QWEN_LORA_REPO, weight_name=QWEN_LORA_FILE, adapter_name="lightning")
+        pipe.fuse_lora(adapter_names=["lightning"])
+        pipe.unload_lora_weights()
+        pipe.to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    for attr in ("safety_checker", "feature_extractor"):
+        if hasattr(pipe, attr):
+            setattr(pipe, attr, None)
+    _pipes[name] = pipe
+    print(f"[EDIT] {name} loaded in {time.time() - t0:.1f}s, VRAM {torch.cuda.memory_allocated() / 1e9:.1f} GB", flush=True)
+    return pipe
 
 
-def fetch_image(url_or_b64):
-    """Fetch image from URL or decode base64."""
-    if url_or_b64.startswith("http"):
+def fetch_image(src):
+    if src.startswith("http"):
         import requests
-        r = requests.get(url_or_b64, timeout=60)
+        r = requests.get(src, timeout=60)
         r.raise_for_status()
         return Image.open(io.BytesIO(r.content)).convert("RGB")
-    else:
-        img_bytes = base64.b64decode(url_or_b64)
-        return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    return Image.open(io.BytesIO(base64.b64decode(src))).convert("RGB")
+
+
+def fit(img):
+    """Langste zijde max 1536, veelvoud van 16 (beide modellen willen dat)."""
+    w, h = img.size
+    if max(w, h) > MAX_SIDE:
+        s = MAX_SIDE / max(w, h)
+        w, h = int(w * s), int(h * s)
+    w, h = (w // 16) * 16, (h // 16) * 16
+    if img.size != (w, h):
+        img = img.resize((w, h), Image.LANCZOS)
+    return img
 
 
 def handler(job):
-    """RunPod serverless handler."""
     try:
-        load_model()
-
-        inp = job.get("input", {})
-
-        # Health check for warmup pings
+        inp = job.get("input", {}) or {}
+        model = inp.get("model") or DEFAULT_MODEL
+        model = "klein" if model == "klein" else "qwen"
         if inp.get("health_check"):
-            load_model()
-            return {"status": "ok", "mode": "kontext", "message": "Model loaded and ready"}
+            load_model(model)
+            return {"status": "ok", "mode": model, "message": "Model loaded and ready"}
 
-        image_src = inp.get("image", "")
-        prompt = inp.get("prompt", "")
-        guidance_scale = float(inp.get("guidance_scale", 2.5))
-        num_steps = int(inp.get("num_inference_steps", 28))
-        seed = inp.get("seed", None)
-        target_width = inp.get("width", None)
-        target_height = inp.get("height", None)
-
-        if not image_src:
+        src = inp.get("image", "")
+        prompt = (inp.get("prompt") or "").strip()
+        if not src:
             return {"error": "No input image provided"}
         if not prompt:
             return {"error": "No prompt provided"}
 
-        # Fetch input image
-        print(f"[KONTEXT] Fetching input image...", flush=True)
-        input_image = fetch_image(image_src)
-        orig_w, orig_h = input_image.size
-        print(f"[KONTEXT] Input: {orig_w}x{orig_h}", flush=True)
-
-        # Resize if target dimensions specified, otherwise use input size
-        # Round to nearest 16 for FLUX compatibility
-        if target_width and target_height:
-            w = (int(target_width) // 16) * 16
-            h = (int(target_height) // 16) * 16
-        else:
-            # Keep original aspect ratio, max 1536 on longest side
-            max_side = 1536
-            if max(orig_w, orig_h) > max_side:
-                scale = max_side / max(orig_w, orig_h)
-                w = (int(orig_w * scale) // 16) * 16
-                h = (int(orig_h * scale) // 16) * 16
-            else:
-                w = (orig_w // 16) * 16
-                h = (orig_h // 16) * 16
-
-        if input_image.size != (w, h):
-            input_image = input_image.resize((w, h), Image.LANCZOS)
-            print(f"[KONTEXT] Resized to {w}x{h}", flush=True)
-
-        # Set seed
+        seed = inp.get("seed")
         if seed is None:
             import random
             seed = random.randint(0, 2**32 - 1)
-        generator = torch.Generator("cuda").manual_seed(int(seed))
+        gen = torch.Generator("cuda").manual_seed(int(seed))
 
-        # Generate
-        print(f"[KONTEXT] Generating: steps={num_steps}, guidance={guidance_scale}, seed={seed}", flush=True)
-        print(f"[KONTEXT] Prompt: {prompt[:100]}...", flush=True)
+        img = fit(fetch_image(src))
+        w, h = img.size
+        pipe = load_model(model)
+        print(f"[EDIT] {model}: {w}x{h}, seed {seed}, prompt: {prompt[:100]}", flush=True)
 
         t0 = time.time()
-        result = pipe(
-            image=input_image,
-            prompt=prompt,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_steps,
-            generator=generator,
-            width=w,
-            height=h,
-        )
-        inference_time = time.time() - t0
-        print(f"[KONTEXT] Done in {inference_time:.1f}s", flush=True)
+        with torch.inference_mode():
+            if model == "klein":
+                steps = int(inp.get("num_inference_steps") or 4)
+                out = pipe(prompt=prompt, image=img, width=w, height=h, guidance_scale=float(inp.get("guidance_scale") or 1.0),
+                           num_inference_steps=steps, generator=gen)
+            else:
+                steps = int(inp.get("num_inference_steps") or 8)
+                out = pipe(image=[img], prompt=prompt, negative_prompt=" ", true_cfg_scale=1.0, guidance_scale=1.0,
+                           num_inference_steps=steps, width=w, height=h, num_images_per_prompt=1, generator=gen)
+        dt = time.time() - t0
+        result = out.images[0]
+        print(f"[EDIT] done in {dt:.1f}s", flush=True)
 
-        output_image = result.images[0]
-
-        # Encode to base64 PNG
         buf = io.BytesIO()
-        output_image.save(buf, format="PNG", optimize=True)
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
+        result.save(buf, format="PNG", optimize=True)
         return {
-            "image": img_b64,
-            "mode": "kontext",
-            "seed": seed,
-            "inference_time": round(inference_time, 2),
-            "resolution": f"{w}x{h}",
+            "image": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "mode": model,
+            "seed": int(seed),
+            "inference_time": round(dt, 2),
+            "resolution": f"{result.size[0]}x{result.size[1]}",
         }
-
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
