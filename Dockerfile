@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     runpod \
     git+https://github.com/huggingface/diffusers.git \
-    'transformers>=4.56.0,<5' \
+    'transformers>=4.56.0' \
     accelerate \
     peft \
     safetensors \
