@@ -47,6 +47,7 @@ QWEN_LORA_FILE = "Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-8steps-V1.
 KLEIN_ID = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_MODEL = os.environ.get("TGND_EDIT_MODEL", "qwen")
 MAX_SIDE = 1536
+MAX_SIDE_QWEN = 1024  # Qwen codeert de invoer twee keer (conditie + latent): boven ~1 MP loopt een 80 GB-kaart vol
 
 _pipes = {}
 
@@ -86,11 +87,11 @@ def fetch_image(src):
     return Image.open(io.BytesIO(base64.b64decode(src))).convert("RGB")
 
 
-def fit(img):
-    """Langste zijde max 1536, veelvoud van 16 (beide modellen willen dat)."""
+def fit(img, max_side=MAX_SIDE):
+    """Langste zijde begrensd, veelvoud van 16 (beide modellen willen dat)."""
     w, h = img.size
-    if max(w, h) > MAX_SIDE:
-        s = MAX_SIDE / max(w, h)
+    if max(w, h) > max_side:
+        s = max_side / max(w, h)
         w, h = int(w * s), int(h * s)
     w, h = (w // 16) * 16, (h // 16) * 16
     if img.size != (w, h):
@@ -120,7 +121,7 @@ def handler(job):
             seed = random.randint(0, 2**32 - 1)
         gen = torch.Generator("cuda").manual_seed(int(seed))
 
-        img = fit(fetch_image(src))
+        img = fit(fetch_image(src), MAX_SIDE_QWEN if model == "qwen" else MAX_SIDE)
         w, h = img.size
         pipe = load_model(model)
         print(f"[EDIT] {model}: {w}x{h}, seed {seed}, prompt: {prompt[:100]}", flush=True)
@@ -137,6 +138,8 @@ def handler(job):
                            num_inference_steps=steps, width=w, height=h, num_images_per_prompt=1, generator=gen)
         dt = time.time() - t0
         result = out.images[0]
+        del out
+        torch.cuda.empty_cache()
         print(f"[EDIT] done in {dt:.1f}s", flush=True)
 
         buf = io.BytesIO()
@@ -150,6 +153,10 @@ def handler(job):
         }
     except Exception as e:
         traceback.print_exc()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         return {"error": str(e)}
 
 
