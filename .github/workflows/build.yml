@@ -53,6 +53,8 @@ jobs:
           labels: |
             org.opencontainers.image.description=TGND Flux Kontext Dev image editing on RunPod
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Make package public
         run: |
